@@ -137,24 +137,71 @@ def load_model(checkpoint_path: str, device: torch.device):
     return model, vocab, ckpt.get("epoch", "?"), ckpt.get("val_cer", None), arch_name
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Inference
-# ─────────────────────────────────────────────────────────────────────────────
+def _single_predict(pil_img, model, vocab, device):
+    """Greedy CTC inference. Returns (decoded_string, mean_log_prob_confidence)."""
+    transform = get_val_transforms(img_height=32)
+    tensor    = transform(pil_img).unsqueeze(0).to(device)  # (1,1,32,W)
+    with torch.no_grad():
+        log_probs = model(tensor)                           # (T,1,C)
+    # confidence = mean of the max log-prob at each time step (higher = more certain)
+    confidence = log_probs.max(dim=-1).values.mean().item()
+    pred_idx   = log_probs.argmax(dim=-1).squeeze(1)        # (T,)
+    return vocab.decode(pred_idx.tolist()), confidence
+
+
+def predict_tta(pil_img, model, vocab, device, use_tta=True):
+    """
+    Test-Time Augmentation for real-world photos.
+
+    Runs inference 3× with different CLAHE contrast settings, then picks
+    the prediction with the highest mean log-probability (most confident).
+
+    Parameters
+    ----------
+    pil_img  : PIL.Image (already grayscale, Otsu-binarised)
+    use_tta  : bool — if False falls back to single inference (faster)
+
+    Returns
+    -------
+    (best_prediction: str, confidence: float, candidates: list[str])
+    """
+    if not use_tta:
+        text, conf = _single_predict(pil_img, model, vocab, device)
+        return text, conf, [text]
+
+    img_np = np.array(pil_img)  # grayscale uint8
+
+    # Three CLAHE strengths: subtle / moderate / strong
+    clip_limits = [2.0, 3.0, 4.5]
+    candidates  = []
+    confidences = []
+
+    for clip in clip_limits:
+        clahe     = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
+        enhanced  = clahe.apply(img_np)
+        _, binary = cv2.threshold(enhanced, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Polarity: ensure dark text on white
+        if np.mean(binary) < 128:
+            binary = cv2.bitwise_not(binary)
+        variant = Image.fromarray(binary, mode="L")
+        text, conf = _single_predict(variant, model, vocab, device)
+        candidates.append(text)
+        confidences.append(conf)
+
+    best_idx = int(np.argmax(confidences))
+    return candidates[best_idx], confidences[best_idx], candidates
+
+
 def predict(
     pil_img: Image.Image,
-    model:   CRNN,
+    model,
     vocab:   Vocab,
     device:  torch.device,
 ) -> str:
-    """Run greedy-CTC inference on a pre-processed PIL image."""
-    transform = get_val_transforms(img_height=32)
-    tensor    = transform(pil_img).unsqueeze(0).to(device)  # (1,1,32,W)
-
-    with torch.no_grad():
-        log_probs    = model(tensor)                         # (T,1,C)
-        pred_indices = log_probs.argmax(dim=-1).squeeze(1)  # (T,)
-
-    return vocab.decode(pred_indices.tolist())
+    """Legacy single-pass predict (used by infer.py and test.py)."""
+    text, _ = _single_predict(pil_img, model, vocab, device)
+    return text
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,11 +258,20 @@ def main():
         print("  Preprocess : minimal (already grayscale scan-style image)")
         pil_img = pil_img.convert("L")
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-    result = predict(pil_img, model, vocab, device)
+    # ── Inference (TTA for photos, single-pass for clean scans) ──────────────
+    use_tta = is_photo and not args.no_preprocess
+    result, confidence, candidates = predict_tta(pil_img, model, vocab, device, use_tta=use_tta)
 
     print()
     print("─" * 62)
+    if use_tta:
+        print(f"  Mode       : TTA (3 CLAHE variants → best by confidence)")
+        print(f"  Confidence : {confidence:.4f}  (mean log-prob, higher = more certain)")
+        if len(set(candidates)) > 1:
+            print(f"  TTA candidates:")
+            for i, c in enumerate(candidates, 1):
+                print(f"    [{i}] {c!r}")
+    print()
     print("  Predicted text:")
     print()
     print(f"    {result!r}")
