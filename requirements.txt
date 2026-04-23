@@ -1,0 +1,21 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# requirements.txt — CNN-BiLSTM-CTC Handwritten Text Recognition
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Core deep learning (CUDA-enabled builds assumed via conda 'ai' environment)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Image I/O
+Pillow>=9.0.0
+
+# Data handling
+pandas>=1.5.0
+numpy>=1.23.0
+
+# Levenshtein distance for CER / WER computation
+# Install with:  conda run -n ai pip install python-Levenshtein
+python-Levenshtein>=0.21.0
+
+# Progress bars
+tqdm>=4.65.0
