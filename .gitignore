@@ -1,3 +1,35 @@
-__pycache__
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+env/
+venv/
+.conda/
+
+# ── PyTorch / model weights ────────────────────────────────────────────────────
+# Uncomment if you don't want to track checkpoints in git:
 checkpoints
-data
+
+# ── Dataset images ─────────────────────────────────────────────────────────────
+# The data/ folder is large — track CSVs only, not images
+data/train/
+data/test/
+data/validation/
+data/all/
+
+# ── Logs & reports ─────────────────────────────────────────────────────────────
+
+
+# ── IDE & OS ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db

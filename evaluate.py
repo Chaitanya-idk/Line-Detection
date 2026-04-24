@@ -25,7 +25,7 @@ from torch.utils.data import DataLoader
 import pandas as pd
 
 # ── project imports ──────────────────────────────────────────────────────────
-from models.crnn      import CRNN
+from models.crnn      import CRNN, CRNN_V2
 from utils.vocab      import Vocab
 from utils.dataset    import HTRDataset, collate_fn
 from utils.transforms import get_val_transforms
@@ -120,20 +120,22 @@ def evaluate(
     print(f"[evaluate] Using device: {device}")
 
     # ── Load checkpoint ──────────────────────────────────────────────────────
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Reconstruct vocabulary from the checkpoint
-    vocab_chars = checkpoint["vocab_chars"]   # sorted list of chars
-    # Re-build vocab object from the saved char list
+    vocab_chars = checkpoint["vocab_chars"]
     vocab = Vocab.__new__(Vocab)
     vocab.char2idx = {ch: i + 1 for i, ch in enumerate(vocab_chars)}
     vocab.idx2char = {i: ch for ch, i in vocab.char2idx.items()}
     vocab.size     = len(vocab_chars)
 
-    # ── Build model ──────────────────────────────────────────────────────────
-    model = CRNN(img_height=32, num_classes=vocab.size).to(device)
+    # ── Build model (auto-detect V1 vs V2 from filename) ─────────────────────
+    model_cls = CRNN_V2 if "v2" in os.path.basename(checkpoint_path).lower() else CRNN
+    arch_name = "CRNN_V2" if model_cls is CRNN_V2 else "CRNN V1"
+    model = model_cls(img_height=32, num_classes=vocab.size).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
+    print(f"[evaluate] Architecture : {arch_name}")
     print(f"[evaluate] Model loaded from {checkpoint_path}")
 
     # ── Dataset & DataLoader ─────────────────────────────────────────────────
@@ -199,7 +201,7 @@ def evaluate(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate HTR model on a test split")
     parser.add_argument(
-        "--checkpoint", type=str, default="checkpoints/best_model.pth",
+        "--checkpoint", type=str, default="checkpoints/best_model_v2.pth",
         help="Path to the model checkpoint (.pth)"
     )
     parser.add_argument(

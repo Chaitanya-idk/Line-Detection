@@ -205,7 +205,7 @@ def train(
     weight_decay:    float = 1e-4,
     num_workers:     int  = 4,
     checkpoint_dir:  str  = "checkpoints",
-    log_path:        str  = "training_log.csv",
+    log_path:        str  = "logs/training_log.csv",
     early_stop_patience: int = 5,
     img_height:      int  = 32,
     arch:            str  = "v1",      # "v1" or "v2"
@@ -478,7 +478,7 @@ if __name__ == "__main__":
     parser.add_argument("--workers",    type=int,   default=4,
                         help="DataLoader num_workers (set 0 on Windows if issues)")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
-    parser.add_argument("--log",        type=str,   default="training_log.csv",
+    parser.add_argument("--log",        type=str,   default="logs/training_log.csv",
                         help="Path for per-epoch CSV log")
     parser.add_argument("--patience",   type=int,   default=7,
                         help="Early stopping patience (epochs)")

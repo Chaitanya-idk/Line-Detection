@@ -1,451 +1,312 @@
 """
-test.py — Full test-set evaluation + test_report.md generation
+test.py
+=======
+Run the trained HTR model on the held-out test set and report metrics.
 
-Usage:  python test.py
-        python test.py --checkpoint checkpoints/best_model_v2.pth
+What it does
+------------
+1. Loads the best checkpoint (V1 or V2 auto-detected from filename).
+2. Runs CTC greedy decoding over the full test split with a progress bar.
+3. Reports:
+   - Mean / Median / Std CER and WER
+   - CER distribution buckets (perfect / <10% / <25% / <50% / ≥50%)
+   - Top-5 best predictions  (lowest CER)
+   - Top-5 worst predictions (highest CER)
+   - First N sample predictions (ground truth vs. predicted)
+4. Optionally saves per-sample results to a CSV file.
+
+Usage
+-----
+    python test.py                                        # defaults
+    python test.py --checkpoint checkpoints/best_model_v2.pth
+    python test.py --checkpoint checkpoints/best_model.pth
+    python test.py --samples 20 --save logs/test_results.csv
 """
-from __future__ import annotations
-import argparse, os, sys
-from collections import Counter
-from datetime import datetime
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import statistics
+import sys
+from typing import List, Tuple
+
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# ── project imports ───────────────────────────────────────────────────────────
+sys.path.insert(0, os.path.dirname(__file__))
 from models.crnn      import CRNN, CRNN_V2
 from utils.vocab      import Vocab
 from utils.dataset    import HTRDataset, collate_fn
 from utils.transforms import get_val_transforms
 
+# ── optional fast Levenshtein; pure-Python fallback ───────────────────────────
 try:
-    import Levenshtein as _lev
-    def _edit(a, b):     return _lev.distance(a, b)
-    def _editops(a, b):  return _lev.editops(a, b)
-    HAS_EDITOPS = True
+    import Levenshtein
+    def _edit(a: str, b: str) -> int:
+        return Levenshtein.distance(a, b)
 except ImportError:
-    def _edit(a, b):
+    def _edit(a: str, b: str) -> int:          # type: ignore[misc]
         m, n = len(a), len(b)
         dp = list(range(n + 1))
         for i in range(1, m + 1):
             prev, dp[0] = dp[0], i
             for j in range(1, n + 1):
-                t = dp[j]
+                temp = dp[j]
                 dp[j] = prev if a[i-1] == b[j-1] else 1 + min(prev, dp[j], dp[j-1])
-                prev = t
+                prev = temp
         return dp[n]
-    def _editops(a, b): return []
-    HAS_EDITOPS = False
-
-ASSETS = "test_report_assets"
-REPORT = "test_report.md"
-
-plt.rcParams.update({
-    "font.family": "DejaVu Sans",
-    "axes.grid": True, "grid.color": "#E0E0E0", "grid.linewidth": 0.5,
-    "axes.facecolor": "#F8F9FA", "figure.facecolor": "white",
-})
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
-def load_model(ckpt_path, device):
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _cer(pred: str, gt: str) -> float:
+    if len(gt) == 0:
+        return 0.0 if len(pred) == 0 else 1.0
+    return _edit(pred, gt) / len(gt)
+
+
+def _wer(pred: str, gt: str) -> float:
+    gt_w, pr_w = gt.split(), pred.split()
+    if len(gt_w) == 0:
+        return 0.0 if len(pr_w) == 0 else 1.0
+    return _edit(" ".join(pr_w), " ".join(gt_w)) / len(gt_w)
+
+
+def _load_model(checkpoint_path: str, device: torch.device):
+    """Load model + vocab from checkpoint; auto-detect V1 vs V2."""
+    if not os.path.isfile(checkpoint_path):
+        sys.exit(f"[error] Checkpoint not found: {checkpoint_path}")
+
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
     chars = ckpt["vocab_chars"]
     vocab = Vocab.__new__(Vocab)
-    vocab.char2idx = {c: i+1 for i, c in enumerate(chars)}
-    vocab.idx2char = {i: c for c, i in vocab.char2idx.items()}
-    vocab.size = len(chars)
-    cls = CRNN_V2 if "v2" in os.path.basename(ckpt_path).lower() else CRNN
-    model = cls(img_height=32, num_classes=vocab.size).to(device)
+    vocab.char2idx = {ch: i + 1 for i, ch in enumerate(chars)}
+    vocab.idx2char = {i: ch for ch, i in vocab.char2idx.items()}
+    vocab.size     = len(chars)
+
+    is_v2     = "v2" in os.path.basename(checkpoint_path).lower()
+    model_cls = CRNN_V2 if is_v2 else CRNN
+    model     = model_cls(img_height=32, num_classes=vocab.size).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
-    return model, vocab, ckpt.get("epoch","?"), ckpt.get("val_cer", None), cls.__name__
 
-def ctc_decode(log_probs, vocab):
-    return [vocab.decode(s.tolist()) for s in log_probs.argmax(-1).permute(1, 0)]
-
-def compute_cer(p, g): return _edit(p, g) / max(len(g), 1)
-def compute_wer(p, g):
-    return _edit(" ".join(p.split()), " ".join(g.split())) / max(len(g.split()), 1)
-
-def ops(pred, gt):
-    s = i = d = 0
-    for op, *_ in _editops(gt, pred):
-        if op == "replace": s += 1
-        elif op == "insert": i += 1
-        else: d += 1
-    return s, i, d
-
-def _save(fig, name):
-    p = os.path.join(ASSETS, name)
-    fig.savefig(p, dpi=150, bbox_inches="tight"); plt.close(fig)
-    return p
+    arch = "CRNN_V2" if is_v2 else "CRNN V1"
+    return model, vocab, arch, ckpt.get("epoch", "?"), ckpt.get("val_cer", None)
 
 
-# ── inference ─────────────────────────────────────────────────────────────────
-def run_inference(model, loader, vocab, device):
-    paths = loader.dataset.image_paths
-    results, idx = [], 0
-    with torch.no_grad():
-        for imgs, lbl_cat, inp_lens, lbl_lens in tqdm(loader, desc="Evaluating", unit="batch"):
-            imgs = imgs.to(device)
-            preds = ctc_decode(model(imgs).cpu(), vocab)
-            offset = 0
-            for pred, ll in zip(preds, lbl_lens.tolist()):
-                gt = vocab.decode(lbl_cat[offset:offset+ll].tolist(), remove_blanks=False)
-                offset += ll
-                c = compute_cer(pred, gt)
-                w = compute_wer(pred, gt)
-                s, ins, d = ops(pred, gt) if HAS_EDITOPS else (0, 0, 0)
-                results.append(dict(
-                    img_path=paths[idx], gt=gt, pred=pred,
-                    cer=c, wer=w, exact=(pred == gt),
-                    subs=s, ins=ins, dels=d,
-                    gt_len=len(gt), gt_words=len(gt.split()),
-                ))
-                idx += 1
-    return results
+def _print_section(title: str, width: int = 64) -> None:
+    print(f"\n{'─' * width}")
+    print(f"  {title}")
+    print(f"{'─' * width}")
 
 
-# ── plots ─────────────────────────────────────────────────────────────────────
-def plot_cer_hist(cer, wer):
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-    for ax, scores, label, color in zip(
-        axes,
-        [cer, wer],
-        ["Character Error Rate (CER)", "Word Error Rate (WER)"],
-        ["#4F8EF7", "#F7934F"],
-    ):
-        ax.hist(scores, bins=40, color=color, edgecolor="white", linewidth=0.5)
-        ax.axvline(np.mean(scores), color="black", ls="--", lw=1.5,
-                   label=f"Mean = {np.mean(scores):.4f}")
-        ax.axvline(np.median(scores), color="purple", ls=":", lw=1.5,
-                   label=f"Median = {np.median(scores):.4f}")
-        ax.set_xlabel(label); ax.set_ylabel("Samples")
-        ax.set_title(f"{label} Distribution", fontweight="bold"); ax.legend()
-    fig.tight_layout()
-    return _save(fig, "cer_wer_distribution.png")
-
-
-def plot_cumulative(cer, wer):
-    fig, ax = plt.subplots(figsize=(9, 4))
-    for scores, label, color in [(cer, "CER", "#4F8EF7"), (wer, "WER", "#F7934F")]:
-        xs = np.sort(scores)
-        ys = np.arange(1, len(xs)+1) / len(xs)
-        ax.plot(xs, ys, color=color, label=label, linewidth=2)
-    for thresh in [0.05, 0.10, 0.20, 0.30]:
-        ax.axvline(thresh, color="grey", ls=":", lw=0.8, alpha=0.6)
-        ax.text(thresh+0.002, 0.02, f"{thresh:.0%}", fontsize=7, color="grey")
-    ax.set_xlabel("Error Rate Threshold"); ax.set_ylabel("Fraction of Samples ≤ Threshold")
-    ax.set_title("Cumulative Error Distribution", fontweight="bold")
-    ax.legend(); fig.tight_layout()
-    return _save(fig, "cumulative_distribution.png")
-
-
-def plot_cer_vs_length(results):
-    lens = [r["gt_len"] for r in results]
-    cers = [r["cer"]    for r in results]
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.scatter(lens, cers, alpha=0.3, s=8, color="#4F8EF7")
-    # trend line
-    z = np.polyfit(lens, cers, 1)
-    xs = np.linspace(min(lens), max(lens), 200)
-    ax.plot(xs, np.poly1d(z)(xs), color="#E53935", lw=2, label="Trend")
-    ax.set_xlabel("Ground-truth Text Length (chars)")
-    ax.set_ylabel("CER"); ax.set_title("CER vs Text Length", fontweight="bold")
-    ax.legend(); fig.tight_layout()
-    return _save(fig, "cer_vs_length.png")
-
-
-def plot_cer_by_bucket(results):
-    df = pd.DataFrame(results)
-    df["bucket"] = pd.cut(df["gt_len"], bins=[0,10,20,30,40,60,200],
-                           labels=["1-10","11-20","21-30","31-40","41-60","60+"])
-    stats = df.groupby("bucket", observed=True)["cer"].mean()
-    fig, ax = plt.subplots(figsize=(9, 4))
-    bars = ax.bar(stats.index.astype(str), stats.values, color="#4F8EF7", edgecolor="white")
-    for bar, v in zip(bars, stats.values):
-        ax.text(bar.get_x() + bar.get_width()/2, v + 0.005, f"{v:.3f}",
-                ha="center", fontsize=8, fontweight="bold")
-    ax.set_xlabel("Text Length Bucket (chars)"); ax.set_ylabel("Mean CER")
-    ax.set_title("Mean CER by Text Length Bucket", fontweight="bold")
-    fig.tight_layout()
-    return _save(fig, "cer_by_bucket.png")
-
-
-def plot_edit_ops(results):
-    total_s = sum(r["subs"] for r in results)
-    total_i = sum(r["ins"]  for r in results)
-    total_d = sum(r["dels"] for r in results)
-    total   = max(total_s + total_i + total_d, 1)
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4))
-    labels = ["Substitutions", "Insertions", "Deletions"]
-    counts = [total_s, total_i, total_d]
-    colors = ["#F7934F", "#4F8EF7", "#E53935"]
-    axes[0].bar(labels, counts, color=colors, edgecolor="white")
-    for i, (label, count) in enumerate(zip(labels, counts)):
-        axes[0].text(i, count + total*0.005, f"{count:,}\n({count/total:.1%})",
-                     ha="center", fontsize=9, fontweight="bold")
-    axes[0].set_title("Edit Operations (absolute)", fontweight="bold")
-    axes[0].set_ylabel("Count")
-    axes[1].pie(counts, labels=labels, colors=colors, autopct="%1.1f%%",
-                startangle=90, textprops={"fontsize": 10})
-    axes[1].set_title("Edit Operations (proportion)", fontweight="bold")
-    fig.tight_layout()
-    return _save(fig, "edit_operations.png")
-
-
-def plot_performance_buckets(results):
-    cer_vals = [r["cer"] for r in results]
-    n = len(cer_vals)
-    buckets = {
-        "Perfect\n(CER=0)":       sum(c == 0 for c in cer_vals),
-        "Excellent\n(<5%)":       sum(0 < c < 0.05 for c in cer_vals),
-        "Good\n(5-10%)":          sum(0.05 <= c < 0.10 for c in cer_vals),
-        "Fair\n(10-20%)":         sum(0.10 <= c < 0.20 for c in cer_vals),
-        "Poor\n(20-50%)":         sum(0.20 <= c < 0.50 for c in cer_vals),
-        "Very Poor\n(≥50%)":      sum(c >= 0.50 for c in cer_vals),
-    }
-    colors = ["#4CAF50","#8BC34A","#FFC107","#FF9800","#F44336","#B71C1C"]
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-    bars = axes[0].bar(buckets.keys(), buckets.values(), color=colors, edgecolor="white")
-    for bar, v in zip(bars, buckets.values()):
-        axes[0].text(bar.get_x()+bar.get_width()/2, v+1, f"{v}\n({v/n:.1%})",
-                     ha="center", fontsize=8, fontweight="bold")
-    axes[0].set_ylabel("Samples"); axes[0].set_title("Performance Bucket Distribution", fontweight="bold")
-    axes[1].pie(buckets.values(), labels=buckets.keys(), colors=colors,
-                autopct="%1.1f%%", startangle=90, textprops={"fontsize": 9})
-    axes[1].set_title("Performance Bucket Proportions", fontweight="bold")
-    fig.tight_layout()
-    return _save(fig, "performance_buckets.png")
-
-
-def plot_training_history():
-    for log in ["training_log_v2.csv", "training_log.csv"]:
-        if os.path.isfile(log):
-            df = pd.read_csv(log)
-            fig, axes = plt.subplots(1, 2, figsize=(13, 4))
-            axes[0].plot(df["epoch"], df["train_loss"], label="Train Loss", color="#4F8EF7", lw=2)
-            axes[0].plot(df["epoch"], df["val_loss"],   label="Val Loss",   color="#F7934F", lw=2)
-            axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("CTC Loss")
-            axes[0].set_title("Training & Validation Loss", fontweight="bold"); axes[0].legend()
-            axes[1].plot(df["epoch"], df["val_cer"]*100, label="Val CER", color="#E53935", lw=2)
-            axes[1].plot(df["epoch"], df["val_wer"]*100, label="Val WER", color="#9C27B0", lw=2)
-            axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Error Rate (%)")
-            axes[1].set_title("Validation CER & WER", fontweight="bold"); axes[1].legend()
-            fig.tight_layout()
-            return _save(fig, "training_history.png"), log
-    return None, None
-
-
-# ── report writer ─────────────────────────────────────────────────────────────
-def write_report(results, meta, plot_paths, log_file):
-    cer_vals = [r["cer"] for r in results]
-    wer_vals = [r["wer"] for r in results]
-    n = len(results)
-
-    best  = sorted(results, key=lambda r: r["cer"])[:10]
-    worst = sorted(results, key=lambda r: r["cer"], reverse=True)[:10]
-    # random 10 mid-range
-    mid   = sorted(results, key=lambda r: abs(r["cer"] - np.mean(cer_vals)))[:10]
-
-    total_s = sum(r["subs"] for r in results)
-    total_i = sum(r["ins"]  for r in results)
-    total_d = sum(r["dels"] for r in results)
-    total_errs = max(total_s + total_i + total_d, 1)
-
-    bucket_counts = {
-        "Perfect (CER=0)":   sum(c == 0 for c in cer_vals),
-        "Excellent (<5%)":   sum(0 < c < 0.05 for c in cer_vals),
-        "Good (5–10%)":      sum(0.05 <= c < 0.10 for c in cer_vals),
-        "Fair (10–20%)":     sum(0.10 <= c < 0.20 for c in cer_vals),
-        "Poor (20–50%)":     sum(0.20 <= c < 0.50 for c in cer_vals),
-        "Very Poor (≥50%)":  sum(c >= 0.50 for c in cer_vals),
-    }
-
-    lines = []
-    def w(*args): lines.extend(args); lines.append("")
-
-    w(f"# HTR Model — Test Report",
-      f"> Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  |  "
-      f"Model: **{meta['arch']}**  |  "
-      f"Checkpoint: `{meta['ckpt']}`",
-      "---")
-
-    w("## 1. Model Information",
-      f"| Field | Value |",
-      f"|---|---|",
-      f"| Architecture | {meta['arch']} |",
-      f"| Checkpoint | `{meta['ckpt']}` |",
-      f"| Saved at epoch | {meta['epoch']} |",
-      f"| Val CER (training) | {meta['val_cer']*100:.2f}% |" if meta['val_cer'] else "",
-      f"| Vocab size | {meta['vocab_size']} chars |",
-      f"| Training log | `{log_file}` |" if log_file else "")
-
-    w("## 2. Test Dataset Overview",
-      f"| Field | Value |",
-      f"|---|---|",
-      f"| Total test samples | {n:,} |",
-      f"| Mean text length (chars) | {np.mean([r['gt_len'] for r in results]):.1f} |",
-      f"| Min / Max length | {min(r['gt_len'] for r in results)} / {max(r['gt_len'] for r in results)} |",
-      f"| Mean word count | {np.mean([r['gt_words'] for r in results]):.1f} |")
-
-    w("## 3. Overall Performance",
-      f"| Metric | Value |",
-      f"|---|---|",
-      f"| **Mean CER** | **{np.mean(cer_vals)*100:.2f}%** |",
-      f"| Median CER | {np.median(cer_vals)*100:.2f}% |",
-      f"| Std CER | {np.std(cer_vals)*100:.2f}% |",
-      f"| Min CER | {np.min(cer_vals)*100:.2f}% |",
-      f"| Max CER | {np.max(cer_vals)*100:.2f}% |",
-      f"| **Mean WER** | **{np.mean(wer_vals)*100:.2f}%** |",
-      f"| Median WER | {np.median(wer_vals)*100:.2f}% |",
-      f"| Exact Match Rate | {sum(r['exact'] for r in results)/n*100:.2f}% ({sum(r['exact'] for r in results):,}/{n:,}) |",
-      f"| Char Accuracy (1-CER) | {(1-np.mean(cer_vals))*100:.2f}% |",
-      f"| Word Accuracy (1-WER) | {(1-np.mean(wer_vals))*100:.2f}% |")
-
-    w("## 4. Performance Buckets",
-      f"| Bucket | Count | Percentage |",
-      f"|---|---:|---:|")
-    for k, v in bucket_counts.items():
-        lines.append(f"| {k} | {v:,} | {v/n*100:.1f}% |")
-    lines.append("")
-
-    # Charts
-    w("## 5. Charts")
-    for title, key in [
-        ("CER & WER Distributions",         "dist"),
-        ("Cumulative Error Distribution",    "cumul"),
-        ("CER vs Text Length",               "scatter"),
-        ("Mean CER by Length Bucket",        "bucket"),
-        ("Edit Operations Breakdown",        "ops"),
-        ("Performance Bucket Distribution",  "perf"),
-        ("Training History",                 "history"),
-    ]:
-        path = plot_paths.get(key)
-        if path:
-            rel = os.path.basename(path)
-            w(f"### {title}", f"![{title}]({ASSETS}/{rel})")
-
-    w("## 6. Edit Operations Analysis",
-      f"| Operation | Count | Proportion |",
-      f"|---|---:|---:|",
-      f"| Substitutions (wrong char) | {total_s:,} | {total_s/total_errs*100:.1f}% |",
-      f"| Insertions (extra char) | {total_i:,} | {total_i/total_errs*100:.1f}% |",
-      f"| Deletions (missing char) | {total_d:,} | {total_d/total_errs*100:.1f}% |",
-      f"| **Total errors** | **{total_errs:,}** | 100% |")
-
-    def sample_table(samples, title):
-        lines.append(f"## {title}")
-        lines.append("")
-        lines.append("| # | Ground Truth | Prediction | CER | WER |")
-        lines.append("|---|---|---|---:|---:|")
-        for i, r in enumerate(samples, 1):
-            gt   = r["gt"][:60]   + ("…" if len(r["gt"])   > 60 else "")
-            pred = r["pred"][:60] + ("…" if len(r["pred"]) > 60 else "")
-            lines.append(f"| {i} | `{gt}` | `{pred}` | {r['cer']*100:.1f}% | {r['wer']*100:.1f}% |")
-        lines.append("")
-
-    sample_table(best,  "7. Best Predictions (lowest CER)")
-    sample_table(mid,   "8. Mid-range Sample Predictions")
-    sample_table(worst, "9. Worst Predictions (highest CER)")
-
-    w("## 10. Observations",
-      "### Strengths",
-      f"- Model achieves **{np.mean(cer_vals)*100:.2f}% mean CER** on the IAM test split.",
-      f"- **{bucket_counts['Perfect (CER=0)']/n*100:.1f}%** of samples are transcribed perfectly.",
-      f"- **{(bucket_counts['Perfect (CER=0)']+bucket_counts['Excellent (<5%)'])/n*100:.1f}%** of samples have CER < 5%.",
-      "- Character substitutions dominate errors — the model reads the right number of characters but confuses similar-looking glyphs.",
-      "",
-      "### Weaknesses & Domain Gap",
-      "- Performance degrades on **real-world camera photos** (different lighting, ink color, perspective).",
-      "- The model was trained on clean IAM scanner images — it has not seen blue ink, paper texture, or camera noise during training.",
-      "- Longer lines (>40 chars) tend to have higher CER due to accumulated LSTM errors.",
-      "",
-      "## 11. Recommendations to Improve Generalization",
-      "",
-      "| Priority | Technique | Expected Gain |",
-      "|---|---|---|",
-      "| 🔴 High | **Test-Time Augmentation (TTA)** — run inference with 3 CLAHE params, pick highest confidence | ~1–2% CER |",
-      "| 🔴 High | **Beam Search CTC decoding** (beam=10) instead of greedy | ~1–3% CER |",
-      "| 🟡 Med  | **Domain-adaptive augmentation** — simulate camera photos (RandomPerspective + ColorJitter) during training (already added in V2) | ~2–4% CER |",
-      "| 🟡 Med  | **Fine-tune on small real-world labeled set** — even 100 labeled camera photos boosts real-world accuracy dramatically | ~10–20% on photos |",
-      "| 🟢 Low  | **Character-level language model** (4-gram) for CTC rescoring | ~1–2% CER |",
-      "| 🟢 Low  | **Larger training data** — IAM + RIMES + CVL datasets combined | ~3–5% CER |",
-      "| 🟢 Low  | **Attention mechanism** in addition to CTC | ~2–4% CER |",
-      "",
-      "---",
-      f"*Report generated by `test.py` on {datetime.now().strftime('%Y-%m-%d %H:%M')}*")
-
-    with open(REPORT, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-    print(f"\n[report] Written → {REPORT}")
-
-
-# ── main ──────────────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint",  default="checkpoints/best_model_v2.pth")
-    parser.add_argument("--csv",         default="data/test.csv")
-    parser.add_argument("--img_dir",     default="data")
-    parser.add_argument("--batch_size",  type=int, default=32)
-    parser.add_argument("--workers",     type=int, default=0)
-    args = parser.parse_args()
+# ─────────────────────────────────────────────────────────────────────────────
+# Main test routine
+# ─────────────────────────────────────────────────────────────────────────────
+def run_test(
+    checkpoint_path: str = "checkpoints/best_model_v2.pth",
+    csv_path:        str = "data/test.csv",
+    img_dir:         str = "data",
+    batch_size:      int = 32,
+    num_workers:     int = 0,
+    num_samples:     int = 10,
+    save_path:       str | None = None,
+) -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[test] Device: {device}")
 
-    os.makedirs(ASSETS, exist_ok=True)
+    # ── Header ────────────────────────────────────────────────────────────────
+    print("=" * 64)
+    print("  HTR Model — Test Set Evaluation")
+    print("=" * 64)
+    print(f"  Device     : {device}" +
+          (f"  ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
-    # Load model
-    model, vocab, epoch, val_cer, arch = load_model(args.checkpoint, device)
-    print(f"[test] {arch}  |  epoch {epoch}  |  val CER {val_cer*100:.2f}%")
+    model, vocab, arch, saved_epoch, saved_cer = _load_model(checkpoint_path, device)
 
-    # Dataset
-    ds = HTRDataset(args.csv, args.img_dir, vocab, transform=get_val_transforms(32))
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.workers, collate_fn=collate_fn)
-    print(f"[test] {len(ds)} test samples")
+    print(f"  Checkpoint : {checkpoint_path}")
+    print(f"  Architecture : {arch}")
+    print(f"  Saved epoch  : {saved_epoch}")
+    if saved_cer:
+        print(f"  Val CER      : {saved_cer * 100:.2f}%")
+    print(f"  Vocab size   : {vocab.size} characters")
+    print(f"  Test CSV     : {csv_path}")
 
-    # Run inference
-    results = run_inference(model, loader, vocab, device)
+    # ── Dataset ───────────────────────────────────────────────────────────────
+    transform = get_val_transforms(img_height=32)
+    dataset   = HTRDataset(csv_path, img_dir, vocab, transform=transform)
+    loader    = DataLoader(
+        dataset,
+        batch_size  = batch_size,
+        shuffle     = False,
+        num_workers = num_workers,
+        collate_fn  = collate_fn,
+    )
+    print(f"  Test samples : {len(dataset)}")
 
-    # Aggregate
-    cer_vals = [r["cer"] for r in results]
-    wer_vals = [r["wer"] for r in results]
-    print(f"\n[test] Mean CER : {np.mean(cer_vals)*100:.2f}%")
-    print(f"[test] Mean WER : {np.mean(wer_vals)*100:.2f}%")
-    print(f"[test] Exact    : {sum(r['exact'] for r in results)/len(results)*100:.2f}%")
+    # ── Inference loop ────────────────────────────────────────────────────────
+    all_preds: List[str] = []
+    all_gts:   List[str] = []
 
-    # Plots
-    print("\n[test] Generating charts …")
-    plot_paths = {}
-    plot_paths["dist"]    = plot_cer_hist(cer_vals, wer_vals)
-    plot_paths["cumul"]   = plot_cumulative(cer_vals, wer_vals)
-    plot_paths["scatter"] = plot_cer_vs_length(results)
-    plot_paths["bucket"]  = plot_cer_by_bucket(results)
-    if HAS_EDITOPS:
-        plot_paths["ops"] = plot_edit_ops(results)
-    plot_paths["perf"]    = plot_performance_buckets(results)
-    hist_path, log_file   = plot_training_history()
-    if hist_path: plot_paths["history"] = hist_path
+    bar = tqdm(
+        loader,
+        desc          = "  Testing",
+        unit          = "batch",
+        dynamic_ncols = True,
+        colour        = "green",
+    )
 
-    meta = dict(arch=arch, ckpt=args.checkpoint, epoch=epoch,
-                val_cer=val_cer, vocab_size=vocab.size)
-    write_report(results, meta, plot_paths, log_file)
+    with torch.no_grad():
+        for images, labels_concat, input_lengths, label_lengths in bar:
+            images = images.to(device)
 
-    # Save raw results CSV
-    pd.DataFrame(results).drop(columns=["gt","pred"]).to_csv(
-        os.path.join(ASSETS, "per_sample_metrics.csv"), index=False)
-    print(f"[test] Per-sample CSV → {ASSETS}/per_sample_metrics.csv")
-    print(f"\n[test] Done.  Open {REPORT} to view the full report.")
+            log_probs    = model(images)                         # (T, B, C)
+            pred_indices = log_probs.argmax(dim=-1).permute(1, 0)  # (B, T)
+            preds        = [vocab.decode(seq.tolist()) for seq in pred_indices]
+            all_preds.extend(preds)
+
+            labels_cpu = labels_concat.cpu()
+            offset     = 0
+            for length in label_lengths.tolist():
+                indices = labels_cpu[offset: offset + length].tolist()
+                all_gts.append(vocab.decode(indices, remove_blanks=False))
+                offset += length
+
+            # Running CER in postfix
+            running_cer = statistics.mean(
+                _cer(p, g) for p, g in zip(all_preds, all_gts)
+            )
+            bar.set_postfix(CER=f"{running_cer * 100:.2f}%")
+
+    bar.close()
+
+    # ── Compute per-sample metrics ────────────────────────────────────────────
+    cer_scores: List[float] = [_cer(p, g) for p, g in zip(all_preds, all_gts)]
+    wer_scores: List[float] = [_wer(p, g) for p, g in zip(all_preds, all_gts)]
+
+    n          = len(cer_scores)
+    mean_cer   = statistics.mean(cer_scores)
+    median_cer = statistics.median(cer_scores)
+    std_cer    = statistics.stdev(cer_scores) if n > 1 else 0.0
+    mean_wer   = statistics.mean(wer_scores)
+    median_wer = statistics.median(wer_scores)
+
+    # ── Summary metrics ───────────────────────────────────────────────────────
+    _print_section("Summary Metrics")
+    print(f"  Samples evaluated : {n}")
+    print()
+    print(f"  {'Metric':<20}  {'Mean':>8}  {'Median':>8}  {'Std':>8}")
+    print(f"  {'─'*20}  {'─'*8}  {'─'*8}  {'─'*8}")
+    print(f"  {'CER':<20}  {mean_cer*100:>7.2f}%  {median_cer*100:>7.2f}%  {std_cer*100:>7.2f}%")
+    print(f"  {'WER':<20}  {mean_wer*100:>7.2f}%  {median_wer*100:>7.2f}%  {'—':>8}")
+
+    # ── CER distribution ──────────────────────────────────────────────────────
+    _print_section("CER Distribution")
+    buckets: List[Tuple[str, int]] = [
+        ("Perfect  (CER = 0%)",       sum(c == 0.0                  for c in cer_scores)),
+        ("Good     (0% < CER < 10%)", sum(0.0 < c < 0.10           for c in cer_scores)),
+        ("OK       (10% ≤ CER < 25%)",sum(0.10 <= c < 0.25         for c in cer_scores)),
+        ("Poor     (25% ≤ CER < 50%)",sum(0.25 <= c < 0.50         for c in cer_scores)),
+        ("Bad      (CER ≥ 50%)",       sum(c >= 0.50                for c in cer_scores)),
+    ]
+    for label, count in buckets:
+        pct  = count / n * 100
+        bar_ = "█" * int(pct / 2)
+        print(f"  {label:<30}  {count:>5} ({pct:5.1f}%)  {bar_}")
+
+    # ── Top-5 best ────────────────────────────────────────────────────────────
+    _print_section("Top 5 — Best Predictions  (lowest CER)")
+    ranked = sorted(range(n), key=lambda i: cer_scores[i])
+    for rank, idx in enumerate(ranked[:5], 1):
+        print(f"  [{rank}] CER={cer_scores[idx]*100:.1f}%")
+        print(f"       GT  : {all_gts[idx]!r}")
+        print(f"       PRED: {all_preds[idx]!r}")
+
+    # ── Top-5 worst ───────────────────────────────────────────────────────────
+    _print_section("Top 5 — Worst Predictions  (highest CER)")
+    for rank, idx in enumerate(reversed(ranked[-5:]), 1):
+        print(f"  [{rank}] CER={cer_scores[idx]*100:.1f}%")
+        print(f"       GT  : {all_gts[idx]!r}")
+        print(f"       PRED: {all_preds[idx]!r}")
+
+    # ── Sample predictions ────────────────────────────────────────────────────
+    _print_section(f"First {min(num_samples, n)} Sample Predictions")
+    print(f"  {'#':<4}  {'CER':>6}  {'Ground Truth → Predicted'}")
+    print(f"  {'─'*4}  {'─'*6}  {'─'*50}")
+    for i in range(min(num_samples, n)):
+        cer_str = f"{cer_scores[i]*100:5.1f}%"
+        gt_str  = all_gts[i][:35].ljust(35)
+        pr_str  = all_preds[i][:35]
+        print(f"  {i+1:<4}  {cer_str}  {gt_str!r:>37}  →  {pr_str!r}")
+
+    # ── Save results ──────────────────────────────────────────────────────────
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        with open(save_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["index", "ground_truth", "predicted", "cer", "wer"])
+            for i, (gt, pred, cer, wer) in enumerate(
+                zip(all_gts, all_preds, cer_scores, wer_scores)
+            ):
+                writer.writerow([i, gt, pred, f"{cer:.4f}", f"{wer:.4f}"])
+        print(f"\n  Results saved → {save_path}")
+
+    print(f"\n{'═' * 64}")
+    print(f"  Final  CER : {mean_cer*100:.2f}%   WER : {mean_wer*100:.2f}%")
+    print(f"{'═' * 64}\n")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Evaluate trained HTR model on the test split",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--checkpoint", type=str, default="checkpoints/best_model_v2.pth",
+        help="Path to checkpoint file (.pth)",
+    )
+    parser.add_argument(
+        "--csv", type=str, default="data/test.csv",
+        help="Path to the test CSV (col0=image_path, col1=text)",
+    )
+    parser.add_argument(
+        "--img_dir", type=str, default="data",
+        help="Root directory that image paths in the CSV are relative to",
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=32,
+        help="Inference batch size",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=0,
+        help="DataLoader workers (use 0 on Windows)",
+    )
+    parser.add_argument(
+        "--samples", type=int, default=10,
+        help="Number of sample predictions to print",
+    )
+    parser.add_argument(
+        "--save", type=str, default=None,
+        metavar="PATH",
+        help="Optional path to save per-sample CSV (e.g. logs/test_results.csv)",
+    )
+    args = parser.parse_args()
+
+    run_test(
+        checkpoint_path = args.checkpoint,
+        csv_path        = args.csv,
+        img_dir         = args.img_dir,
+        batch_size      = args.batch_size,
+        num_workers     = args.workers,
+        num_samples     = args.samples,
+        save_path       = args.save,
+    )
